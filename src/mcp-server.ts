@@ -64,6 +64,20 @@ export class McpDispatchAbortedError extends Error {
   }
 }
 
+/**
+ * "注入后无法确定是否已执行"的两类拒绝(兜底超时 / 回合收尾)。
+ *
+ * 用 `name` 而非 `instanceof`:发布形态下本模块可能出现多份实例,跨实例的
+ * 对象 instanceof 不命中,回落重执就会再次发生(见 EndpointState 说明)。
+ */
+function isDispatchStopped(error: unknown): error is McpDispatchTimeoutError | McpDispatchAbortedError {
+  const name = (error as { name?: unknown } | null | undefined)?.name
+  return name === 'McpDispatchTimeoutError'
+    || name === 'McpDispatchAbortedError'
+    || error instanceof McpDispatchTimeoutError
+    || error instanceof McpDispatchAbortedError
+}
+
 /** 活跃端点的凭据(每插件进程一份)。 */
 interface McpEndpoint {
   key: string
@@ -102,21 +116,28 @@ export function registerMcpLoopDispatcher(sessionId: string, dispatch: McpLoopDi
   }
 }
 
-let endpoint: McpEndpoint | undefined
 /**
- * 端点 key:**进程生命周期内稳定**。
+ * 端点状态。
  *
- * 重注册(插件热重载、多调用方轮换)只换路由持有者,不换端点身份——否则每次
- * 重建都换 key,已写入各 CLI 配置(codebuddy 的 --mcp-config、agy 的
- * mcp_config.json)的 URL 当场失效,正在运行的 CLI 持久进程工具调用全数
- * bad key(实测:改插件 → build → 实例重建后即复现)。
- *
- * 刻意不在 dispose 里清空:key 只对 loopback 上的本进程端点有意义,进程
- * 退出即随之消亡,保留不会有跨进程风险。
+ * - **挂 globalThis(Symbol.for)**:发布形态下若依赖副本使本模块出现多份
+ *   实例(两桥依赖不同版本),各实例仍共享同一份端点/key——否则会重现
+ *   "两把 key + 双路由,后写配置当场失效"的历史 bug(错误类型的 instanceof
+ *   同理由 name 判断替代)。
+ * - **key 进程生命周期内稳定**:重注册(热重载、多调用方轮换)只换路由持有
+ *   者,不换端点身份——否则每次重建都换 key,已写入各 CLI 配置的 URL 当场
+ *   失效,正在运行的 CLI 持久进程工具调用全数 bad key。刻意不在 dispose
+ *   清空:key 只对 loopback 本进程端点有意义,进程退出即随之消亡。
  */
-let stableKey: string | undefined
-/** 实际监听端口解析(webserver listen 前 port 为 0;生成配置时现取)。 */
-let resolvePort: (() => number) | undefined
+const ENDPOINT_STATE_KEY = Symbol.for('@flg1217/dsh-mcp/endpoint-state')
+interface EndpointState {
+  endpoint?: McpEndpoint
+  /** 实际监听端口解析(webserver listen 前 port 为 0;生成配置时现取)。 */
+  resolvePort?: () => number
+  stableKey?: string
+}
+const state: EndpointState = ((globalThis as Record<symbol, EndpointState | undefined>)[
+  ENDPOINT_STATE_KEY
+] ??= {}) as EndpointState
 
 /** webserver 服务面(最小结构类型,不引依赖)。 */
 interface WebServerFace {
@@ -249,9 +270,9 @@ interface ConnectionFace {
  * mcp_config.json 的 dsh 条目)。
  */
 export function dshMcpEndpointUrl(sessionId: string): string | undefined {
-  if (endpoint === undefined || resolvePort === undefined) return undefined
-  return `http://127.0.0.1:${resolvePort()}${DSH_MCP_ENDPOINT_PATH}`
-    + `?session=${encodeURIComponent(sessionId)}&key=${endpoint.key}`
+  if (state.endpoint === undefined || state.resolvePort === undefined) return undefined
+  return `http://127.0.0.1:${state.resolvePort()}${DSH_MCP_ENDPOINT_PATH}`
+    + `?session=${encodeURIComponent(sessionId)}&key=${state.endpoint.key}`
 }
 
 /**
@@ -266,7 +287,7 @@ export function dshMcpEndpointUrl(sessionId: string): string | undefined {
  * @returns 释放函数。
  */
 export function registerDshMcpServer(ctx: Context): () => void {
-  if (endpoint !== undefined) return () => {}
+  if (state.endpoint !== undefined) return () => {}
   const injectable = ctx as unknown as {
     inject?: (
       deps: string[],
@@ -280,19 +301,19 @@ export function registerDshMcpServer(ctx: Context): () => void {
   const fiber = injectable.inject(['webServer'], (injected) => {
     // 二道守卫:多次调用各自的 inject 回调会排队依次执行,外层守卫拦不住
     // (首次同步调用时 endpoint 还没赋值)。已在册即让位——谁先落地谁持有。
-    if (endpoint !== undefined) return
+    if (state.endpoint !== undefined) return
     const web = injected.get('webServer') as WebServerFace | undefined
     if (web?.register === undefined) return
     // 端口动态解析:webserver listen 完成前 port 可能是 0——生成配置时现取,
     // 优先 webserver 实际监听值,退 connection 服务,再退 3080。
     const conn = (ctx as unknown as { get: (key: string) => unknown }).get('connection') as ConnectionFace | undefined
-    resolvePort = () => {
+    state.resolvePort = () => {
       const live = web.port
       if (typeof live === 'number' && live > 0) return live
       return conn?.webServer?.port ?? 3080
     }
-    const myEndpoint: McpEndpoint = { key: (stableKey ??= randomBytes(18).toString('hex')) }
-    endpoint = myEndpoint
+    const myEndpoint: McpEndpoint = { key: (state.stableKey ??= randomBytes(18).toString('hex')) }
+    state.endpoint = myEndpoint
     const disposeRoute = web.register({
       kind: 'exact',
       path: DSH_MCP_ENDPOINT_PATH,
@@ -321,9 +342,9 @@ export function registerDshMcpServer(ctx: Context): () => void {
       disposed = true
       disposeRoute()
       // 只清自己那一对:避免把后来者的端点/端口解析误清(多实例、热重载)。
-      if (endpoint === myEndpoint) {
-        endpoint = undefined
-        resolvePort = undefined
+      if (state.endpoint === myEndpoint) {
+        state.endpoint = undefined
+        state.resolvePort = undefined
       }
     }
   })
@@ -354,8 +375,8 @@ async function readBody(req: IncomingMessage, limit = 4 * 1024 * 1024): Promise<
  * @returns 是否匹配当前活跃端点。
  */
 function keyMatches(candidate: string | null): boolean {
-  if (endpoint === undefined || candidate === null) return false
-  const expected = Buffer.from(endpoint.key, 'utf8')
+  if (state.endpoint === undefined || candidate === null) return false
+  const expected = Buffer.from(state.endpoint.key, 'utf8')
   const actual = Buffer.from(candidate, 'utf8')
   if (expected.length !== actual.length) return false
   return timingSafeEqual(expected, actual)
@@ -548,7 +569,7 @@ async function handleMcpRequest(ctx: Context, req: IncomingMessage, res: ServerR
           respond({ content: await contentOf(result, result.output) })
           return
         } catch (error) {
-          if (error instanceof McpDispatchTimeoutError || error instanceof McpDispatchAbortedError) {
+          if (isDispatchStopped(error)) {
             // 两类都属"注入后无法确定工具是否已在 loop 侧执行"(兜底超时 /
             // 回合收尾):原样回 isError 且**不回落重执**——回落会让同一
             // 副作用跑两次(实测:会话收尾路径曾按普通 Error 回落,把已注入

@@ -379,6 +379,23 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     disposeAborted()
   })
 
+  it('跨模块副本的拒绝(仅 name 相同,instanceof 不命中)→ 仍不回落重执', async () => {
+    // 发布形态下本模块可能出现多份实例:对方副本抛的错误过不了本副本的
+    // instanceof,判定必须同时认 name,否则回落重执在真实环境照样发生。
+    harness = await makeHarness()
+    const foreign = Object.assign(new Error('副本抛出的收尾拒绝'), { name: 'McpDispatchAbortedError' })
+    const disposeForeign = registerMcpLoopDispatcher('sess-ok', async () => { throw foreign })
+    const rejected = await rpc(harness, {
+      jsonrpc: '2.0', id: 13, method: 'tools/call',
+      params: { name: 'grep', arguments: { pattern: 'build' } },
+    })
+    const result = rejected.json?.['result'] as { isError?: boolean; content?: { text?: string }[] }
+    expect(result.isError).toBe(true)
+    expect(result.content?.[0]?.text).toContain('未回落直执')
+    expect(harness.executeCalls).toHaveLength(0)
+    disposeForeign()
+  })
+
 })
 
 describe('客户端断连后才完成的调用:结果必须补投进会话', () => {
