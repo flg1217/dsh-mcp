@@ -35,6 +35,8 @@ async function makeHarness(
     agentStatus?: string
     /** attachments 服务面(图片回传用;缺省 = 无服务,图片降级为纯文本)。 */
     attachments?: { readImage: (ref: unknown) => Promise<{ data: Uint8Array; ref: { mediaType: string } }> }
+    /** 追加到可见工具面的 schema(测试特定工具,如命令执行工具)。 */
+    extraSchemas?: Array<{ name: string; description: string; parameters: unknown }>
   } = {},
 ): Promise<McpTestHarness> {
   const executeCalls: Array<Record<string, unknown>> = []
@@ -45,6 +47,7 @@ async function makeHarness(
       { name: 'read_image', description: 'Read an image.', parameters: { type: 'object', properties: {} } },
       { name: 'cli_read', description: 'mirror noise', parameters: {} },
       { name: 'mcp__x__y', description: 'mcp noise', parameters: {} },
+      ...options.extraSchemas ?? [],
     ],
     execute: async (call: Record<string, unknown>) => {
       executeCalls.push(call)
@@ -191,6 +194,37 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
       params: { name: 'cli_read', arguments: {} },
     })
     expect((bad.json?.['result'] as { isError?: boolean }).isError).toBe(true)
+  })
+
+  it('命令工具漏填 description(仅 UI 元数据)时自动派生;已有描述不覆盖', async () => {
+    harness = await makeHarness({
+      extraSchemas: [{
+        name: 'pwsh',
+        description: 'Execute a command.',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' }, description: { type: 'string' } },
+          required: ['command', 'description'],
+        },
+      }],
+    })
+    // 现场:AGY 每次首轮的壳调用都漏 description → dsh 校验硬拒、白跑一次
+    // (会话 914637da 实证)。端点派生兜底后首次调用即成功。
+    const first = await rpc(harness, {
+      jsonrpc: '2.0', id: 21, method: 'tools/call',
+      params: { name: 'pwsh', arguments: { command: 'node -e "console.log(1)"' } },
+    })
+    expect(first.json?.['result']).toEqual({ content: [{ type: 'text', text: 'executed!' }] })
+    expect(harness.executeCalls[0]).toMatchObject({
+      name: 'pwsh',
+      arguments: { command: 'node -e "console.log(1)"', description: 'node -e "console.log(1)"' },
+    })
+    // 模型自带描述时保持原样(不被覆盖)。
+    await rpc(harness, {
+      jsonrpc: '2.0', id: 22, method: 'tools/call',
+      params: { name: 'pwsh', arguments: { command: 'ls', description: 'List files' } },
+    })
+    expect(harness.executeCalls[1]).toMatchObject({ arguments: { command: 'ls', description: 'List files' } })
   })
 
   it('tools/call 结果含图片 → MCP content 带 image 块(base64;CLI 侧转 image_url 给模型)', async () => {
