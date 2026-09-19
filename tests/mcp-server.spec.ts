@@ -416,7 +416,7 @@ describe('客户端断连后才完成的调用:结果必须补投进会话', () 
     const text = JSON.stringify(harness.deliveries[0]?.message ?? {})
     expect(text).toContain('grep')
     expect(text).toContain('executed!')
-    expect(text).toContain('codebuddy-bridge')
+    expect(text).toContain('dsh-mcp')
   })
 
   it('会话忙时排队等下一步,而不是抢开一轮', async () => {

@@ -215,7 +215,7 @@ function deliverAfterClientGone(
     }],
     source: {
       kind: 'plugin',
-      plugin: 'codebuddy-bridge',
+      plugin: 'dsh-mcp',
       form: 'notice',
       // 摘要进 durable log 并渲染成折叠行,所以按 dsh 的 notice 上限截断。
       summary: boundContextSummary(reason === 'client-gone'
