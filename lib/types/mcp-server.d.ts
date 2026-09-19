@@ -26,6 +26,18 @@ export declare const DSH_MCP_SERVER_NAME = "dsh";
 export declare class McpDispatchTimeoutError extends Error {
     constructor(message: string);
 }
+/**
+ * 调用已注入 loop、但回合在结果回填前收尾(dispose/中止)时,由泵抛给端点。
+ *
+ * 与 {@link McpDispatchTimeoutError} 同一语义族:**无法确定**工具是否已在 loop
+ * 侧开始执行——端点必须原样回 isError、**不得回落重执**(重跑会让同一副作用
+ * 执行两次)。此前泵用普通 Error 拒绝,端点按"泵不在、尚未执行"回落直执,
+ * 而该调用其实已被 loop 消费并开始执行(生产实测:同一 pwsh 命令跑了两次)。
+ * 独立类型让日志能区分"兜底超时"与"回合收尾"两条路径。
+ */
+export declare class McpDispatchAbortedError extends Error {
+    constructor(message: string);
+}
 /** MCP → loop 转发器(由回合泵在生命周期内注册)。 */
 export type McpLoopDispatcher = (sessionId: string, name: string, input: Record<string, unknown>, 
 /**

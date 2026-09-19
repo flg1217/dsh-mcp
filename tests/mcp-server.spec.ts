@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   DSH_MCP_ENDPOINT_PATH,
+  McpDispatchAbortedError,
   McpDispatchTimeoutError,
   registerDshMcpServer,
   registerMcpLoopDispatcher,
@@ -284,6 +285,20 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     expect((unknown.json?.['result'] as { protocolVersion?: string }).protocolVersion).toBe('2025-03-26')
   })
 
+  it('端点 key 稳定:释放后重新注册复用同一把 key(已写入 CLI 配置的 URL 不失效)', async () => {
+    // 回归:key 若随重建更换,各 CLI 配置文件里的旧 URL 当场失效,正在运行的
+    // CLI 持久进程工具调用全数 bad key(实测:改插件 → 重建实例即复现)。
+    harness = await makeHarness()
+    const firstKey = harness.key
+    await harness.close()
+    harness = undefined
+    disposeServer?.()
+    disposeServer = undefined
+
+    harness = await makeHarness()
+    expect(harness.key).toBe(firstKey)
+  })
+
   it('执行失败 → isError 内容;坏 key/坏 JSON 拒绝', async () => {
     harness = await makeHarness({ toolsExecuteError: true })
     const failed = await rpc(harness, {
@@ -344,6 +359,24 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     // 关键断言:直接执行通道零调用(没有第二次执行)。
     expect(harness.executeCalls).toHaveLength(0)
     disposeTimeout()
+  })
+
+  it('转发因回合收尾被拒(McpDispatchAbortedError)→ 同样不回落重执', async () => {
+    // 回归:泵 dispose 曾用普通 Error 拒绝,端点按"泵不在、尚未执行"回落直执,
+    // 而该调用其实已被 loop 消费并开始执行——同一副作用跑两遍(生产实测)。
+    harness = await makeHarness()
+    const disposeAborted = registerMcpLoopDispatcher('sess-ok', async () => {
+      throw new McpDispatchAbortedError('CodeBuddy 回合已收尾,该调用结果未能回填')
+    })
+    const aborted = await rpc(harness, {
+      jsonrpc: '2.0', id: 12, method: 'tools/call',
+      params: { name: 'grep', arguments: { pattern: 'build' } },
+    })
+    const result = aborted.json?.['result'] as { isError?: boolean; content?: { text?: string }[] }
+    expect(result.isError).toBe(true)
+    expect(result.content?.[0]?.text).toContain('未回落直执')
+    expect(harness.executeCalls).toHaveLength(0)
+    disposeAborted()
   })
 
 })

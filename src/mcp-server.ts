@@ -9,10 +9,10 @@
  * @module dsh-mcp/mcp-server
  */
 
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { appendFileSync, mkdirSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { homedir, tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -45,6 +45,22 @@ export class McpDispatchTimeoutError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'McpDispatchTimeoutError'
+  }
+}
+
+/**
+ * 调用已注入 loop、但回合在结果回填前收尾(dispose/中止)时,由泵抛给端点。
+ *
+ * 与 {@link McpDispatchTimeoutError} 同一语义族:**无法确定**工具是否已在 loop
+ * 侧开始执行——端点必须原样回 isError、**不得回落重执**(重跑会让同一副作用
+ * 执行两次)。此前泵用普通 Error 拒绝,端点按"泵不在、尚未执行"回落直执,
+ * 而该调用其实已被 loop 消费并开始执行(生产实测:同一 pwsh 命令跑了两次)。
+ * 独立类型让日志能区分"兜底超时"与"回合收尾"两条路径。
+ */
+export class McpDispatchAbortedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'McpDispatchAbortedError'
   }
 }
 
@@ -87,6 +103,18 @@ export function registerMcpLoopDispatcher(sessionId: string, dispatch: McpLoopDi
 }
 
 let endpoint: McpEndpoint | undefined
+/**
+ * 端点 key:**进程生命周期内稳定**。
+ *
+ * 重注册(插件热重载、多调用方轮换)只换路由持有者,不换端点身份——否则每次
+ * 重建都换 key,已写入各 CLI 配置(codebuddy 的 --mcp-config、agy 的
+ * mcp_config.json)的 URL 当场失效,正在运行的 CLI 持久进程工具调用全数
+ * bad key(实测:改插件 → build → 实例重建后即复现)。
+ *
+ * 刻意不在 dispose 里清空:key 只对 loopback 上的本进程端点有意义,进程
+ * 退出即随之消亡,保留不会有跨进程风险。
+ */
+let stableKey: string | undefined
 /** 实际监听端口解析(webserver listen 前 port 为 0;生成配置时现取)。 */
 let resolvePort: (() => number) | undefined
 
@@ -263,7 +291,7 @@ export function registerDshMcpServer(ctx: Context): () => void {
       if (typeof live === 'number' && live > 0) return live
       return conn?.webServer?.port ?? 3080
     }
-    const myEndpoint: McpEndpoint = { key: randomBytes(18).toString('hex') }
+    const myEndpoint: McpEndpoint = { key: (stableKey ??= randomBytes(18).toString('hex')) }
     endpoint = myEndpoint
     const disposeRoute = web.register({
       kind: 'exact',
@@ -520,10 +548,13 @@ async function handleMcpRequest(ctx: Context, req: IncomingMessage, res: ServerR
           respond({ content: await contentOf(result, result.output) })
           return
         } catch (error) {
-          if (error instanceof McpDispatchTimeoutError) {
-            // 兜底触发(注入未被消费 / loop 卡死):**无法确定**工具是否已在 loop
-            // 侧执行,故原样回 isError 且**不回落重执**——回落会让同一副作用跑两次。
-            const line = `[dsh-mcp] MCP 转发兜底超时(不回落重执):session=${sessionId}`
+          if (error instanceof McpDispatchTimeoutError || error instanceof McpDispatchAbortedError) {
+            // 两类都属"注入后无法确定工具是否已在 loop 侧执行"(兜底超时 /
+            // 回合收尾):原样回 isError 且**不回落重执**——回落会让同一
+            // 副作用跑两次(实测:会话收尾路径曾按普通 Error 回落,把已注入
+            // 执行的 pwsh 又跑了一遍)。
+            const kind = error instanceof McpDispatchTimeoutError ? '兜底超时' : '回合收尾'
+            const line = `[dsh-mcp] MCP 转发${kind}(不回落重执):session=${sessionId}`
               + ` tool=${name} clientGone=${clientGoneAt !== undefined} err=${error.message}`
             console.error(line)
             bridgeLog(line)

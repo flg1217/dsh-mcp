@@ -11,7 +11,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { registerDshMcpServer } from './mcp-server.js'
 
-export { DSH_MCP_ENDPOINT_PATH, DSH_MCP_SERVER_NAME, dshMcpEndpointUrl, McpDispatchTimeoutError, registerDshMcpServer, registerMcpLoopDispatcher } from './mcp-server.js'
+export { DSH_MCP_ENDPOINT_PATH, DSH_MCP_SERVER_NAME, dshMcpEndpointUrl, McpDispatchAbortedError, McpDispatchTimeoutError, registerDshMcpServer, registerMcpLoopDispatcher } from './mcp-server.js'
 export type { McpLoopDispatcher } from './mcp-server.js'
 export {
   blocksToMcpContent,
